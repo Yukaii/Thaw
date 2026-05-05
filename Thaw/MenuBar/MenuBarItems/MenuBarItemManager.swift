@@ -2694,8 +2694,10 @@ extension MenuBarItemManager {
         // during a layout reset when items required multiple attempts).
         let mouseLocation = try getMouseLocation()
         MouseHelpers.hideCursor(watchdogTimeout: watchdogTimeout)
+        MouseHelpers.disassociateMouseAndCursor()
         defer {
             MouseHelpers.warpCursor(to: mouseLocation)
+            MouseHelpers.reassociateMouseAndCursor()
             MouseHelpers.showCursor()
         }
 

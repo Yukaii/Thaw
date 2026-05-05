@@ -16,6 +16,8 @@ enum MouseHelpers {
     /// Protected by `cursorLock` — all accesses go through `cursorLock.sync`.
     private static nonisolated(unsafe) var cursorHideCount = 0
     /// Protected by `cursorLock` — all accesses go through `cursorLock.sync`.
+    private static nonisolated(unsafe) var cursorDisassociationCount = 0
+    /// Protected by `cursorLock` — all accesses go through `cursorLock.sync`.
     private static nonisolated(unsafe) var autoShowWorkItem: DispatchWorkItem?
     private static let defaultWatchdogTimeout: DispatchTimeInterval = .seconds(1)
 
@@ -165,6 +167,45 @@ enum MouseHelpers {
         if result != .success {
             diagLog.error("CGAssociateMouseAndMouseCursorPosition failed with error code \(result.rawValue)")
         }
+    }
+
+    /// Temporarily disconnects physical mouse/trackpad movement from the cursor.
+    ///
+    /// Synthetic menu bar drags warp the cursor to Window Server hit-test
+    /// points. While those drags are in flight, trackpad input can otherwise
+    /// visibly pull the cursor away from the hidden drag target.
+    static func disassociateMouseAndCursor() {
+        var shouldDisassociate = false
+        cursorLock.sync {
+            cursorDisassociationCount += 1
+            shouldDisassociate = cursorDisassociationCount == 1
+        }
+
+        guard shouldDisassociate else { return }
+        associateMouseAndCursor(false)
+    }
+
+    /// Reconnects physical mouse/trackpad movement to the cursor when all
+    /// temporary disassociation scopes have completed.
+    static func reassociateMouseAndCursor() {
+        var shouldReassociate = false
+        var wasAlreadyZero = false
+        cursorLock.sync {
+            if cursorDisassociationCount > 0 {
+                cursorDisassociationCount -= 1
+                shouldReassociate = cursorDisassociationCount == 0
+            } else {
+                wasAlreadyZero = true
+            }
+        }
+
+        if wasAlreadyZero {
+            diagLog.debug("reassociateMouseAndCursor called with count already zero")
+            return
+        }
+
+        guard shouldReassociate else { return }
+        associateMouseAndCursor(true)
     }
 
     /// Returns a Boolean value that indicates whether a mouse button
