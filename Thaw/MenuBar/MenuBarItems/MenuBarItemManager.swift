@@ -2635,13 +2635,16 @@ extension MenuBarItemManager {
     /// - Parameters:
     ///   - item: The menu bar item to move.
     ///   - destination: The destination to move the item to.
+    ///   - manageCursor: When `false`, the caller owns cursor hide/show and
+    ///     mouse association for the duration of a multi-move batch.
     func move(
         item: MenuBarItem,
         to destination: MoveDestination,
         on displayID: CGDirectDisplayID? = nil,
         skipInputPause: Bool = false,
         watchdogTimeout: DispatchTimeInterval? = nil,
-        maxMoveAttempts: Int = 8
+        maxMoveAttempts: Int = 8,
+        manageCursor: Bool = true
     ) async throws {
         guard item.isMovable else {
             throw EventError.itemNotMovable(item)
@@ -2692,13 +2695,17 @@ extension MenuBarItemManager {
         // back to it a single time after all attempts, rather than after each
         // individual attempt (which caused the cursor to oscillate many times
         // during a layout reset when items required multiple attempts).
-        let mouseLocation = try getMouseLocation()
-        MouseHelpers.hideCursor(watchdogTimeout: watchdogTimeout)
-        MouseHelpers.disassociateMouseAndCursor()
+        let mouseLocation = manageCursor ? try getMouseLocation() : nil
+        if manageCursor {
+            MouseHelpers.hideCursor(watchdogTimeout: watchdogTimeout)
+            MouseHelpers.disassociateMouseAndCursor()
+        }
         defer {
-            MouseHelpers.warpCursor(to: mouseLocation)
-            MouseHelpers.reassociateMouseAndCursor()
-            MouseHelpers.showCursor()
+            if manageCursor, let mouseLocation {
+                MouseHelpers.warpCursor(to: mouseLocation)
+                MouseHelpers.reassociateMouseAndCursor()
+                MouseHelpers.showCursor()
+            }
         }
 
         let maxAttempts = max(1, maxMoveAttempts)
@@ -3987,7 +3994,8 @@ extension MenuBarItemManager {
             try await move(
                 item: candidate,
                 to: destination,
-                skipInputPause: true
+                skipInputPause: true,
+                maxMoveAttempts: 3
             )
         } catch {
             MenuBarItemManager.diagLog.error("Failed to relocate \(candidate.logString): \(error)")
@@ -4340,7 +4348,12 @@ extension MenuBarItemManager {
 
             do {
                 MenuBarItemManager.diagLog.debug("Starting move for restore: item=\(item.logString), destination=\(destination.logString)")
-                try await move(item: item, to: destination, skipInputPause: true)
+                try await move(
+                    item: item,
+                    to: destination,
+                    skipInputPause: true,
+                    maxMoveAttempts: 3
+                )
                 MenuBarItemManager.diagLog.debug("Move completed successfully for restore")
             } catch let error as EventError {
                 MenuBarItemManager.diagLog.error(
@@ -4489,47 +4502,88 @@ extension MenuBarItemManager {
             let currentFiltered = currentOrder.filter { filteredSavedSet.contains($0) }
             guard currentFiltered != filteredSaved else { continue }
 
+            // Only move items that are out of relative order (LCS), instead of
+            // walking every identifier and re-placing neighbors. Full re-placement
+            // is what made the cursor unusable for ~30s after a single icon change.
+            let lcsItems = longestCommonSubsequence(currentFiltered, filteredSaved)
+            let itemsToMove = filteredSaved.filter { !lcsItems.contains($0) }
+            guard !itemsToMove.isEmpty else { continue }
+
             MenuBarItemManager.diagLog.info(
                 """
                 Restoring saved item order for \(sectionKeyString) section \
-                (\(filteredSaved.count) items)
+                (\(itemsToMove.count)/\(filteredSaved.count) move(s), \
+                LCS kept \(lcsItems.count))
                 """
             )
 
-            // Find the first valid anchor that is not temporarily shown.
-            var anchorIndex = 0
-            var anchor: MenuBarItem?
-            while anchorIndex < filteredSaved.count {
-                guard let candidate = itemsByID[filteredSaved[anchorIndex]] else {
-                    anchorIndex += 1
-                    continue
+            // Hide the cursor once for the whole batch so each move doesn't
+            // hide/show and disassociate the mouse repeatedly.
+            let mouseLocation = try? getMouseLocation()
+            MouseHelpers.hideCursor(watchdogTimeout: .seconds(10))
+            MouseHelpers.disassociateMouseAndCursor()
+            defer {
+                if let mouseLocation {
+                    MouseHelpers.warpCursor(to: mouseLocation)
                 }
-                let tagString = candidate.tag.tagIdentifier
-                if activelyShownTags.contains(tagString) {
-                    anchorIndex += 1
-                    continue
-                }
-                anchor = candidate
-                break
+                MouseHelpers.reassociateMouseAndCursor()
+                MouseHelpers.showCursor()
             }
-            guard let anchor else { continue }
 
-            // Move items right-to-left: the anchor is the rightmost valid item;
-            // each subsequent item is placed to its left.
-            var currentAnchor = anchor
-            for i in (anchorIndex + 1) ..< filteredSaved.count {
-                guard let item = itemsByID[filteredSaved[i]] else { continue }
+            var movedItems = Set<String>()
+            func isStableAnchor(_ candidateUID: String) -> Bool {
+                lcsItems.contains(candidateUID) || movedItems.contains(candidateUID)
+            }
 
-                // Skip items that are currently temporarily shown.
+            for uid in itemsToMove {
+                guard let item = itemsByID[uid] else { continue }
                 let tagString = item.tag.tagIdentifier
                 guard !activelyShownTags.contains(tagString) else { continue }
+                guard let desiredIdx = filteredSaved.firstIndex(of: uid) else { continue }
+
+                // Prefer an already-correct neighbor as the move target.
+                var dest: MoveDestination?
+                if desiredIdx + 1 < filteredSaved.count {
+                    for scanIdx in (desiredIdx + 1) ..< filteredSaved.count {
+                        let candidateUID = filteredSaved[scanIdx]
+                        if isStableAnchor(candidateUID),
+                           let neighbor = itemsByID[candidateUID]
+                        {
+                            dest = .leftOfItem(neighbor)
+                            break
+                        }
+                    }
+                }
+                if dest == nil, desiredIdx > 0 {
+                    for scanIdx in stride(from: desiredIdx - 1, through: 0, by: -1) {
+                        let candidateUID = filteredSaved[scanIdx]
+                        if isStableAnchor(candidateUID),
+                           let neighbor = itemsByID[candidateUID]
+                        {
+                            dest = .rightOfItem(neighbor)
+                            break
+                        }
+                    }
+                }
+                guard let dest else { continue }
 
                 do {
-                    try await move(item: item, to: .leftOfItem(currentAnchor), skipInputPause: true)
+                    try await move(
+                        item: item,
+                        to: dest,
+                        skipInputPause: true,
+                        maxMoveAttempts: 3,
+                        manageCursor: false
+                    )
                     didMove = true
-                    // Only advance the anchor after a successful move so that
-                    // the next item targets the last correctly placed position.
-                    currentAnchor = item
+                    movedItems.insert(uid)
+                    // Refresh local snapshot so subsequent anchors use the
+                    // post-move window identity when available.
+                    if let refreshed = (await MenuBarItem.getMenuBarItems(option: .activeSpace))
+                        .first(where: { $0.uniqueIdentifier == uid })
+                    {
+                        itemsByID[uid] = refreshed
+                    }
                 } catch {
                     MenuBarItemManager.diagLog.error(
                         """
@@ -4939,6 +4993,17 @@ extension MenuBarItemManager {
             appState.hidEventManager.startAll()
         }
 
+        let mouseLocation = try? getMouseLocation()
+        MouseHelpers.hideCursor(watchdogTimeout: Self.layoutWatchdogTimeout)
+        MouseHelpers.disassociateMouseAndCursor()
+        defer {
+            if let mouseLocation {
+                MouseHelpers.warpCursor(to: mouseLocation)
+            }
+            MouseHelpers.reassociateMouseAndCursor()
+            MouseHelpers.showCursor()
+        }
+
         func movePass(_ items: [MenuBarItem], anchor: MenuBarItem) async -> Int {
             var failed = 0
             for item in items {
@@ -4955,7 +5020,9 @@ extension MenuBarItemManager {
                         item: item,
                         to: .leftOfItem(anchor),
                         skipInputPause: true,
-                        watchdogTimeout: Self.layoutWatchdogTimeout
+                        watchdogTimeout: Self.layoutWatchdogTimeout,
+                        maxMoveAttempts: 3,
+                        manageCursor: false
                     )
                 } catch {
                     failed += 1
@@ -5474,9 +5541,15 @@ extension MenuBarItemManager {
                 MenuBarItemManager.diagLog.debug("Profile layout (full sort): \(uid) → .leftOfItem(CC)")
 
                 do {
-                    try await move(item: item, to: dest, skipInputPause: true)
+                    try await move(
+                        item: item,
+                        to: dest,
+                        skipInputPause: true,
+                        maxMoveAttempts: 3,
+                        manageCursor: false
+                    )
                     movedCount += 1
-                    try? await Task.sleep(for: .milliseconds(200))
+                    try? await Task.sleep(for: .milliseconds(100))
                 } catch {
                     MenuBarItemManager.diagLog.error("Profile layout (full sort): failed \(uid): \(error)")
                 }
@@ -5575,9 +5648,15 @@ extension MenuBarItemManager {
                     if let dest {
                         MenuBarItemManager.diagLog.debug("Profile layout: moving AH_ctrl → \(dest.logString)")
                         do {
-                            try await move(item: ahItem, to: dest, skipInputPause: true)
+                            try await move(
+                                item: ahItem,
+                                to: dest,
+                                skipInputPause: true,
+                                maxMoveAttempts: 3,
+                                manageCursor: false
+                            )
                             movedCount += 1
-                            try? await Task.sleep(for: .milliseconds(200))
+                            try? await Task.sleep(for: .milliseconds(100))
                         } catch {
                             MenuBarItemManager.diagLog.error("Profile layout: failed to move AH_ctrl: \(error)")
                         }
@@ -5722,10 +5801,16 @@ extension MenuBarItemManager {
 
                 do {
                     guard let dest else { continue }
-                    try await move(item: item, to: dest, skipInputPause: true)
+                    try await move(
+                        item: item,
+                        to: dest,
+                        skipInputPause: true,
+                        maxMoveAttempts: 3,
+                        manageCursor: false
+                    )
                     movedCount += 1
                     movedItems.insert(uid)
-                    try? await Task.sleep(for: .milliseconds(200))
+                    try? await Task.sleep(for: .milliseconds(100))
                 } catch {
                     MenuBarItemManager.diagLog.error(
                         "Profile layout: failed to move \(uid): \(error)"

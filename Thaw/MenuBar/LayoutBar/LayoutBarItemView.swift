@@ -30,11 +30,11 @@ final class LayoutBarItemView: LayoutBarArrangedView {
     private var cancellables = Set<AnyCancellable>()
 
     /// The item that the view represents.
-    let item: MenuBarItem
+    private(set) var item: MenuBarItem
 
     private lazy var tooltipController = CustomTooltipController(text: item.displayName, view: self)
     private var tooltipTrackingArea: NSTrackingArea?
-    private let placeholderImage: NSImage?
+    private var placeholderImage: NSImage?
 
     /// The image displayed inside the view.
     private var cachedImage: MenuBarItemImageCache.CapturedImage? {
@@ -73,6 +73,20 @@ final class LayoutBarItemView: LayoutBarArrangedView {
     @available(*, unavailable)
     required init?(coder _: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Updates the represented item snapshot without recreating the view.
+    ///
+    /// Cache refreshes publish new `MenuBarItem` values with updated bounds.
+    /// Reusing the view keeps layout stable and avoids mass re-animation.
+    func updateItem(_ newItem: MenuBarItem) {
+        guard item.uniqueIdentifier == newItem.uniqueIdentifier else {
+            return
+        }
+        item = newItem
+        isEnabled = newItem.isMovable
+        placeholderImage = Self.makePlaceholderImage(for: newItem)
+        tooltipController.text = newItem.displayName
     }
 
     private var tooltipDelay: TimeInterval {

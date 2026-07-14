@@ -39,7 +39,8 @@ final class LayoutBarContainer: NSView {
     /// A Boolean value that indicates whether the container should
     /// animate its next layout pass.
     ///
-    /// After each layout pass, this value is reset to `true`.
+    /// After each layout pass, this value is reset to `false`.
+    /// Set it to `true` only for interactive reorders (drag-and-drop).
     var shouldAnimateNextLayoutPass = false
 
     /// A Boolean value that indicates whether the container can
@@ -105,10 +106,13 @@ final class LayoutBarContainer: NSView {
                 appState.itemManager.$newItemsPlacement,
                 appState.settings.advanced.$enableAlwaysHiddenSection
             )
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] cache, _, _ in
                 guard let self else {
                     return
                 }
+                // Cache-driven updates should snap, not animate every icon.
+                shouldAnimateNextLayoutPass = false
                 setArrangedViews(items: cache.managedItems(for: section))
             }
             .store(in: &c)
@@ -192,10 +196,12 @@ final class LayoutBarContainer: NSView {
     ///   Pass `nil` to use the current ``arrangedViews`` array.
     private func layoutArrangedViews(oldViews: [LayoutBarArrangedView]? = nil) {
         defer {
-            shouldAnimateNextLayoutPass = true
+            shouldAnimateNextLayoutPass = false
         }
 
+        let shouldAnimate = shouldAnimateNextLayoutPass
         let oldViews = oldViews ?? arrangedViews
+        let oldOrigins = Dictionary(uniqueKeysWithValues: oldViews.map { (ObjectIdentifier($0), $0.frame.origin) })
 
         // remove views that are no longer part of the arranged views
         for view in oldViews where !arrangedViews.contains(view) {
@@ -213,30 +219,30 @@ final class LayoutBarContainer: NSView {
             .map(\.bounds.height)
             .max() ?? 0
 
-        for var view in arrangedViews {
+        for view in arrangedViews {
+            let targetOrigin = CGPoint(
+                x: previous.map(\.frame.maxX) ?? 0,
+                y: (maxHeight / 2) - view.bounds.midY
+            )
+
             if subviews.contains(view) {
-                // view already exists inside the layout view, but may
-                // have moved from its previous location;
-                if shouldAnimateNextLayoutPass {
-                    // replace the view with its animator proxy
-                    view = view.animator()
+                // Only animate when the view actually changes position.
+                // Animating every existing view on each cache refresh made
+                // the whole layout bar reshuffle whenever one icon moved.
+                let previousOrigin = oldOrigins[ObjectIdentifier(view)]
+                let didMove = previousOrigin.map { abs($0.x - targetOrigin.x) > 0.5 || abs($0.y - targetOrigin.y) > 0.5 } ?? false
+                if shouldAnimate, didMove {
+                    view.animator().setFrameOrigin(targetOrigin)
+                } else {
+                    view.setFrameOrigin(targetOrigin)
                 }
             } else {
                 // view does not already exist inside the layout view;
-                // add it as a subview
+                // add it as a subview without animation
                 addSubview(view)
                 view.hasContainer = true
+                view.setFrameOrigin(targetOrigin)
             }
-
-            // set the view's origin; if the view is an animator proxy,
-            // it will animate to the new position; otherwise, it must
-            // be a newly added view
-            view.setFrameOrigin(
-                CGPoint(
-                    x: previous.map(\.frame.maxX) ?? 0,
-                    y: (maxHeight / 2) - view.bounds.midY
-                )
-            )
 
             previous = view // retain the view
         }
@@ -259,19 +265,30 @@ final class LayoutBarContainer: NSView {
             return
         }
         guard let items else {
-            arrangedViews.removeAll()
+            if !arrangedViews.isEmpty {
+                arrangedViews.removeAll()
+            }
             return
         }
         var newViews = [LayoutBarArrangedView]()
         let itemIdentifiers = items.map(\.uniqueIdentifier)
         let badgeIndex = appState.itemManager.newItemsBadgeIndex(in: section, itemIdentifiers: itemIdentifiers)
+
+        // Reuse views by stable identity (uniqueIdentifier), not full
+        // MenuBarItem equality — equality includes bounds, which change on
+        // every real menu-bar move and would recreate every icon view.
+        var reusableViews = [String: LayoutBarItemView]()
+        for view in arrangedViews {
+            if case let .item(existingItem) = view.kind,
+               let itemView = view as? LayoutBarItemView
+            {
+                reusableViews[existingItem.uniqueIdentifier] = itemView
+            }
+        }
+
         for item in items {
-            if let existingView = arrangedViews.first(where: {
-                if case let .item(existingItem) = $0.kind {
-                    return existingItem == item
-                }
-                return false
-            }) {
+            if let existingView = reusableViews.removeValue(forKey: item.uniqueIdentifier) {
+                existingView.updateItem(item)
                 newViews.append(existingView)
             } else {
                 let view = LayoutBarItemView(appState: appState, item: item)
@@ -284,6 +301,16 @@ final class LayoutBarContainer: NSView {
             let insertionIndex = badgeIndex.clamped(to: newViews.startIndex ... newViews.endIndex)
             newViews.insert(badgeView, at: insertionIndex)
         }
+
+        // Skip a full layout pass when membership and order are unchanged.
+        // Cache refreshes after a single move publish new MenuBarItem snapshots
+        // with updated bounds; without this check every icon re-lays out.
+        if newViews.count == arrangedViews.count,
+           zip(newViews, arrangedViews).allSatisfy({ $0 === $1 })
+        {
+            return
+        }
+
         arrangedViews = newViews
     }
 
@@ -358,10 +385,12 @@ final class LayoutBarContainer: NSView {
                 if destinationIndex > sourceIndex {
                     targetIndex += 1
                 }
+                shouldAnimateNextLayoutPass = true
                 arrangedViews.move(fromOffsets: [sourceIndex], toOffset: targetIndex)
             } else {
                 // source view is being dragged from another container,
                 // so just insert it
+                shouldAnimateNextLayoutPass = true
                 arrangedViews.insert(sourceView, at: destinationIndex)
             }
             return .move
